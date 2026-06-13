@@ -1,0 +1,24 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/pyproject.toml /app/backend/
+COPY backend/mark_api /app/backend/mark_api
+COPY backend/mark_core /app/backend/mark_core
+COPY backend/mark_agents /app/backend/mark_agents
+COPY backend/mark_memory /app/backend/mark_memory
+COPY backend/mark_tools /app/backend/mark_tools
+COPY backend/mark_voice /app/backend/mark_voice
+
+WORKDIR /app/backend
+RUN pip install --no-cache-dir -e .
+
+# Playwright browsers for worker
+RUN pip install playwright && playwright install chromium --with-deps || true
+
+ENV PYTHONPATH=/app/backend
+EXPOSE 8000

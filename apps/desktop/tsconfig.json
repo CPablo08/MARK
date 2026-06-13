@@ -1,0 +1,11 @@
+{
+  "extends": "../../packages/config/tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@mark/ui": ["../../packages/ui/src"],
+      "@mark/shared": ["../../packages/shared/src"]
+    }
+  },
+  "include": ["src"]
+}

@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mark
+      POSTGRES_PASSWORD: mark
+      POSTGRES_DB: mark
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mark"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mark:mark@postgres:5432/mark
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    command: uvicorn mark_api.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mark:mark@postgres:5432/mark
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m mark_core.worker
+
+volumes:
+  postgres_data:
+  qdrant_data:

@@ -1,0 +1,224 @@
+"""Supervised external actions: terminal, email, SMS/calls — user must approve in MARK UI."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import email.message
+import logging
+import os
+import re
+import smtplib
+import ssl
+from pathlib import Path
+
+import httpx
+
+from mark_core.config import get_settings
+
+logger = logging.getLogger("mark.supervised")
+
+FORBIDDEN_SHELL = re.compile(
+    r"(?is)\b(?:sudo|su\s+-|curl\s+.*\|\s*sh|wget\s+.*\|\s*sh|"
+    r"chmod\s+[-+]x.*\b\/dev\/|mkfs|dd\s+if=|:{\s*:\s*\|:\s*&\s*};:)\b"
+)
+SANDBOX_ESCAPE = re.compile(r"(?i)\.\.[\\/]|\$\{?HOME\}?|~\/")
+
+MAX_CMD_LEN = 4000
+MAX_EMAIL_BODY = 200_000
+
+
+def _validate_terminal_command(command: str) -> tuple[bool, str]:
+    c = command.strip()
+    if not c:
+        return False, "Command was empty."
+    if len(c) > MAX_CMD_LEN:
+        return False, "Command too long."
+    if FORBIDDEN_SHELL.search(c):
+        return False, "This command pattern is blocked for safety. Ask the user to run it manually."
+    if SANDBOX_ESCAPE.search(c):
+        return False, "Path escape patterns (.., ~) are blocked in terminal commands."
+    return True, ""
+
+
+def _resolve_terminal_cwd(explicit: str | None) -> tuple[Path, str | None]:
+    settings = get_settings()
+    root = Path(settings.sandbox_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if explicit and explicit.strip():
+        p = Path(explicit).expanduser().resolve()
+        if not settings.terminal_allow_outside_sandbox:
+            try:
+                p.relative_to(root)
+            except ValueError:
+                return root, f"cwd restricted to sandbox ({root}); got {explicit}"
+        return p, None
+    return root, None
+
+
+async def run_terminal_command(command: str, cwd: str | None = None, timeout_sec: int = 120) -> str:
+    ok, err = _validate_terminal_command(command)
+    if not ok:
+        return err
+    workdir, terr = _resolve_terminal_cwd(cwd)
+    if terr:
+        return terr
+    if not workdir.is_dir():
+        return f"Working directory does not exist: {workdir}"
+
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin"),
+        "HOME": str(workdir),
+        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        "TERM": "dumb",
+    }
+
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_shell(
+                command,
+                cwd=str(workdir),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=timeout_sec + 30,
+        )
+    except asyncio.TimeoutError:
+        return "Terminal: process start timed out."
+    except Exception as e:
+        return f"Terminal failed to start: {e}"
+
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "Terminal: killed after timeout."
+
+    out = (stdout or b"").decode(errors="replace").strip()
+    err_part = (stderr or b"").decode(errors="replace").strip()
+    parts = []
+    if out:
+        parts.append(out)
+    if err_part:
+        parts.append("[stderr]\n" + err_part)
+    if proc.returncode != 0:
+        parts.append(f"[exit {proc.returncode}]")
+    body = "\n\n".join(parts) if parts else "(no output)"
+    limit = 12000
+    return body if len(body) <= limit else body[:limit] + "\n… (truncated)"
+
+
+def _smtp_configured() -> bool:
+    s = get_settings()
+    return bool(s.smtp_host and s.smtp_from_email)
+
+
+def send_email_sync(to: str, subject: str, body: str, *, html: bool = False) -> tuple[bool, str]:
+    if not _smtp_configured():
+        return False, (
+            "SMTP not configured. Set SMTP_HOST, SMTP_FROM_EMAIL, "
+            "and SMTP_USERNAME/SMTP_PASSWORD if required in .env."
+        )
+    settings = get_settings()
+    if len(body) > MAX_EMAIL_BODY:
+        body = body[:MAX_EMAIL_BODY] + "\n… (truncated)"
+
+    msg = email.message.EmailMessage()
+    msg["Subject"] = subject[:998]
+    msg["From"] = settings.smtp_from_email
+    msg["To"] = to
+    if html:
+        msg.set_content("Plain-text fallback: switch to rich email client.")
+        msg.add_alternative(body, subtype="html")
+    else:
+        msg.set_content(body)
+
+    try:
+        context = ssl.create_default_context()
+        port = settings.smtp_port
+        host = settings.smtp_host or ""
+        with smtplib.SMTP(host, port, timeout=45) as smtp:
+            if settings.smtp_tls:
+                smtp.starttls(context=context)
+            if settings.smtp_username and settings.smtp_password:
+                smtp.login(settings.smtp_username, settings.smtp_password)
+            smtp.send_message(msg)
+        return True, f"Sent email to {to}"
+    except Exception as e:
+        logger.exception("send_email_sync")
+        return False, f"SMTP error: {e}"
+
+
+async def send_email(to: str, subject: str, body: str, *, html: bool = False) -> str:
+    ok, detail = await asyncio.to_thread(send_email_sync, to, subject, body, html=html)
+    return detail if ok else detail
+
+
+def twilio_configured() -> bool:
+    s = get_settings()
+    return bool(s.twilio_account_sid and s.twilio_auth_token and s.twilio_from_number)
+
+
+async def send_sms_via_twilio(to: str, body: str) -> str:
+    if not twilio_configured():
+        return (
+            "Twilio not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, "
+            "TWILIO_FROM_NUMBER in .env."
+        )
+    s = get_settings()
+    url = (
+        f"https://api.twilio.com/2010-04-01/Accounts/{s.twilio_account_sid}"
+        "/Messages.json"
+    )
+    auth = f"{s.twilio_account_sid}:{s.twilio_auth_token}"
+    basic = base64.b64encode(auth.encode()).decode()
+    payload = {"To": to, "From": s.twilio_from_number or "", "Body": body[:1600]}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                url,
+                data=payload,
+                headers={
+                    "Authorization": f"Basic {basic}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+        if r.is_success:
+            return f"SMS sent to {to}."
+        return f"Twilio error {r.status_code}: {r.text[:500]}"
+    except Exception as e:
+        return f"Twilio SMS failed: {e}"
+
+
+async def start_voice_call_twilio(to: str) -> str:
+    if not twilio_configured():
+        return (
+            "Twilio not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER."
+        )
+    s = get_settings()
+    if not s.twilio_voice_twiml_url:
+        return (
+            "Set TWILIO_VOICE_TWIML_URL to a TwiML URL Twilio will fetch when the call connects."
+        )
+    url = (
+        f"https://api.twilio.com/2010-04-01/Accounts/{s.twilio_account_sid}/Calls.json"
+    )
+    auth = f"{s.twilio_account_sid}:{s.twilio_auth_token}"
+    basic = base64.b64encode(auth.encode()).decode()
+    payload = {"To": to, "From": s.twilio_from_number or "", "Url": s.twilio_voice_twiml_url}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                url,
+                data=payload,
+                headers={
+                    "Authorization": f"Basic {basic}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+        if r.is_success:
+            return f"Outbound call initiated to {to}. Check Twilio console for status."
+        return f"Twilio Calls API error {r.status_code}: {r.text[:500]}"
+    except Exception as e:
+        return f"Twilio call failed: {e}"
